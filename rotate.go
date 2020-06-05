@@ -17,16 +17,18 @@ import (
 )
 
 const (
-	backupTimeFormat   = "2006-01-02T15-04-05.000"
+	backupTimeFormat   = "2006-01-02 15-04-05.000"
 	defaultFileMaxSize = 100
+	fileNameExt = ".log"
 )
 
 const (
 	ConstRotateHour     = iota // 按每小时输出
-	ConstRotateFileSize        // 按照文件大小rotate
+	ConstRotateFileSize        // 按照文件大小rotate，暂时没完全实现功能
 )
 
 var _ io.WriteCloser = (*Logger)(nil)
+var defaultOutput = os.Stdout
 
 type Logger struct {
 	// 文件路径
@@ -53,8 +55,9 @@ type Logger struct {
 
 	// 用于记录文件大小，只在constRotateFileSize下生效
 	size int64
-	// file
-	file *os.File
+
+	writer io.WriteCloser  // 输出
+	isFile bool // 是否是文件，标准输出不需要关闭
 	// 锁
 	mu sync.Mutex
 	// 下次日志刷新时间，constRotateHour模式下有效
@@ -68,9 +71,6 @@ type Logger struct {
 
 	millCh    chan bool
 	startMill sync.Once
-
-	prefix string
-	ext    string
 }
 
 var (
@@ -101,7 +101,7 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 		)
 	}
 
-	if l.file == nil {
+	if l.writer == nil {
 		if err = l.openExistingOrNew(int64(len(p))); err != nil {
 			return 0, err
 		}
@@ -114,7 +114,7 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 		}
 	}
 
-	n, err = l.file.Write(p)
+	n, err = l.writer.Write(p)
 	l.size += int64(n)
 	return n, err
 }
@@ -128,11 +128,11 @@ func (l *Logger) Close() error {
 
 // close closes the file if it is open.
 func (l *Logger) close() error {
-	if l.file == nil {
+	if l.writer == nil || !l.isFile{
 		return nil
 	}
-	err := l.file.Close()
-	l.file = nil
+	err := l.writer.Close()
+	l.writer = nil
 	return err
 }
 
@@ -152,11 +152,16 @@ func (l *Logger) Rotate() error {
 	return l.rotate()
 }
 
+func (l *Logger) emptyFile() bool {
+	return l.FileName == ""
+}
+
 func (l *Logger) rotate() error {
 	// 关闭旧文件，打开新文件
 	if err := l.close(); err != nil {
 		return err
 	}
+
 	if err := l.openNew(); err != nil {
 		return err
 	}
@@ -166,6 +171,12 @@ func (l *Logger) rotate() error {
 }
 
 func (l *Logger) openNew() error {
+	// 如果文件为空，输出到控制台
+	if l.emptyFile() {
+		l.writer = defaultOutput
+		return nil
+	}
+
 	// 目录
 	err := os.MkdirAll(l.dir(), 0744)
 	if err != nil {
@@ -194,7 +205,8 @@ func (l *Logger) openNew() error {
 	if err != nil {
 		return fmt.Errorf("can't open new logfile: %s", err)
 	}
-	l.file = f
+	l.writer = f
+	l.isFile = true
 	l.size = 0
 	l.nextRotateTime = getNextRotateTime()
 	return nil
@@ -203,25 +215,23 @@ func (l *Logger) openNew() error {
 func backupName(name string, local bool) string {
 	dir := filepath.Dir(name)
 	filename := filepath.Base(name)
-	ext := filepath.Ext(filename)
-	prefix := filename[:len(filename)-len(ext)]
 	t := currentTime()
 	if !local {
 		t = t.UTC()
 	}
 
 	timestamp := t.Format(backupTimeFormat)
-	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext))
+	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", filename, timestamp, fileNameExt))
 }
 
 func (l *Logger) openExistingOrNew(writeLen int64) error {
+	// 如果没有配置输出文件名，直接输出到控制台
+	if l.emptyFile() {
+		l.writer = defaultOutput
+		return nil
+	}
+
 	l.mill()
-
-	// 获得日志名的前缀以及后缀
-	logFileName := filepath.Base(l.baseFileName())
-	l.ext = filepath.Ext(logFileName)
-	l.prefix = logFileName[:len(logFileName)-len(l.ext)]
-
 	filename := l.filename()
 	info, err := os_Stat(filename)
 	if os.IsNotExist(err) {
@@ -242,7 +252,8 @@ func (l *Logger) openExistingOrNew(writeLen int64) error {
 	if err != nil {
 		return l.openNew()
 	}
-	l.file = file
+	l.writer = file
+	l.isFile = true
 	l.size = info.Size()
 	l.nextRotateTime = getNextRotateTime()
 	return nil
@@ -347,7 +358,7 @@ func (l *Logger) fileMax() int64 {
 
 // 文件名
 func (l *Logger) filename() string {
-	prefix, ext := l.GetFilePrefix(), l.GetFileExt()
+	prefix, ext := l.baseFileName(), fileNameExt
 	switch l.RotateType {
 	case ConstRotateHour:
 		tm := currentTime()
@@ -355,14 +366,11 @@ func (l *Logger) filename() string {
 		dailyStr := fmt.Sprintf("%04d%02d%02d", tm.Year(), tm.Month(), tm.Day())
 		return path.Join(l.Dir, dailyStr, fmt.Sprintf("%s_%s%s", prefix, tmStr, ext))
 	default:
-		return path.Join(l.Dir, l.baseFileName())
+		return path.Join(l.Dir, prefix+fileNameExt)
 	}
 }
 
 func (l *Logger) baseFileName() string {
-	if l.FileName == "" {
-		return "logger.log"
-	}
 	return l.FileName
 }
 
@@ -376,14 +384,6 @@ func (l *Logger) dir() string {
 	default:
 		return l.Dir
 	}
-}
-
-func (l *Logger) GetFilePrefix() string {
-	return l.prefix
-}
-
-func (l *Logger) GetFileExt() string {
-	return l.ext
 }
 
 func (l *Logger) GetRotateType() int64 {
@@ -407,14 +407,13 @@ func (l *Logger) IsLogFile(f os.FileInfo) bool {
 		return false
 	}
 
-	prefix := l.GetFilePrefix()
-	ext := l.GetFileExt()
+	prefix := l.baseFileName()
 	fileName := f.Name()
 
-	if !strings.HasPrefix(fileName, prefix+"-") {
+	if !strings.HasPrefix(fileName, prefix) {
 		return false
 	}
-	if !strings.HasSuffix(fileName, ext) {
+	if !strings.HasSuffix(fileName, fileNameExt) {
 		return false
 	}
 	return true
@@ -446,3 +445,4 @@ func (b byFormatTime) Swap(i, j int) {
 func (b byFormatTime) Len() int {
 	return len(b)
 }
+
