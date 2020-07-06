@@ -1,6 +1,5 @@
 package rotate
 
-
 import (
 	"fmt"
 	"io"
@@ -19,11 +18,12 @@ import (
 const (
 	backupTimeFormat   = "2006-01-02 15-04-05.000"
 	defaultFileMaxSize = 100
-	fileNameExt = ".log"
+	fileNameExt        = ".log"
 )
 
 const (
-	ConstRotateHour     = iota // 按每小时输出
+	_ = iota
+	ConstRotateHour      // 按每小时输出
 	ConstRotateFileSize        // 按照文件大小rotate，暂时没完全实现功能
 )
 
@@ -36,36 +36,34 @@ type Logger struct {
 	// 文件名
 	FileName string `json:"filename" yaml:"file_name" xml:"filename"`
 	// 单条日志最大长度
-	LogMaxSize int64 `json:"log_max_size" yaml:"log_max_size" xml:"log_max_size"`
-	// 刷新规则
-	RotateType int64 `json:"rotate_type" yaml:"rotate_type" xml:"rotate_type"`
-	// 文件最大长度
-	// 只在constRotateFileSize下生效
-	FileMaxSize int64 `json:"maxsize" yaml:"file_max_size" xml:"file_max_size"`
+	LogMaxSize uint64 `json:"log_max_size" yaml:"log_max_size" xml:"log_max_size"`
+	// 刷新规则 ConstRotateHour，ConstRotateFileSize
+	RotateType uint64 `json:"rotate_type" yaml:"rotate_type" xml:"rotate_type"`
+	// 单个文件的最大size
+	FileMaxSize uint64 `json:"maxsize" yaml:"file_max_size" xml:"file_max_size"`
 	// 文件过期时间
 	// constRotateFileSize模式下对文件创建时间
-	// constRotateHour模式下是文件加创建时间
-	MaxAge int64 `json:"max_age" yaml:"max_age" xml:"max_age"`
+	// constRotateHour模式下是文件夹创建时间
+	MaxAge uint64 `json:"max_age" yaml:"max_age" xml:"max_age"`
 	// 文件最大备份数量
-	// constRotateFileSize模式下生效
-	MaxBackups int64 `json:"max_backups" yaml:"max_backups" xml:"max_backups"`
-
-	// 是否缓存
+	// 只在constRotateFileSize模式下生效
+	MaxBackups uint64 `json:"max_backups" yaml:"max_backups" xml:"max_backups"`
+	// 是否缓存,
+	// todo 暂未支持
 	Cache bool `json:"cache" yaml:"cache" xml:"cache"`
 
-	// 用于记录文件大小，只在constRotateFileSize下生效
-	size int64
-
-	writer io.WriteCloser  // 输出
-	isFile bool // 是否是文件，标准输出不需要关闭
+	// 用于记录文件大小
+	size uint64
+	// 输出
+	writer io.WriteCloser
+	// 是否是文件，标准输出不需要关闭
+	isFile bool
 	// 锁
 	mu sync.Mutex
 	// 下次日志刷新时间，constRotateHour模式下有效
 	nextRotateTime time.Time
-
 	// 是否是本地时间
 	LocalTime bool `json:"localtime" yaml:"localtime" xml:"localtime"`
-
 	// todo 后期可以优化， 缓存
 	cache []byte
 
@@ -92,7 +90,7 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	writeLen := int64(len(p))
+	writeLen := uint64(len(p))
 	// 单条记录不能太长
 	if writeLen > l.logMax() {
 		// 如果记录太长，把栈打出来
@@ -102,20 +100,20 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 	}
 
 	if l.writer == nil {
-		if err = l.openExistingOrNew(int64(len(p))); err != nil {
+		if err = l.openExistingOrNew(uint64(len(p))); err != nil {
 			return 0, err
 		}
 	}
 
 	// 检查是否可以刷新
-	if l.rotateEnable(int64(len(p))) {
+	if l.rotateEnable(uint64(len(p))) {
 		if err := l.rotate(); err != nil {
 			return 0, err
 		}
 	}
 
 	n, err = l.writer.Write(p)
-	l.size += int64(n)
+	l.size += uint64(n)
 	return n, err
 }
 
@@ -128,7 +126,7 @@ func (l *Logger) Close() error {
 
 // close closes the file if it is open.
 func (l *Logger) close() error {
-	if l.writer == nil || !l.isFile{
+	if l.writer == nil || !l.isFile {
 		return nil
 	}
 	err := l.writer.Close()
@@ -137,10 +135,12 @@ func (l *Logger) close() error {
 }
 
 // 是否可以rotate
-func (l *Logger) rotateEnable(writeLen int64) bool {
+func (l *Logger) rotateEnable(writeLen uint64) bool {
 	switch l.RotateType {
 	case ConstRotateHour:
 		return time.Now().UnixNano() >= l.nextRotateTime.UnixNano()
+	case ConstRotateFileSize:
+		return l.size+writeLen > l.fileMax()
 	default:
 		return l.size+writeLen > l.fileMax()
 	}
@@ -187,16 +187,28 @@ func (l *Logger) openNew() error {
 	name := l.filename()
 	mode := os.FileMode(0644)
 	info, err := os_Stat(name)
-	// 对于ConstRotateFileSize类型需要数据备份，且必须MaxBackups > 1
-	if err == nil && l.RotateType == ConstRotateFileSize && l.MaxBackups > 0 {
-		mode = info.Mode()
-		newName := backupName(name, l.LocalTime)
-		if err := os.Rename(name, newName); err != nil {
-			return fmt.Errorf("can't rename log file: %s", err)
-		}
+	// 备份或者删除日志
+	if err == nil {
+		switch l.RotateType {
+		case ConstRotateFileSize:
+			if l.MaxBackups > 0 {
+				// 备份数据
+				mode = info.Mode()
+				newName := backupName(name, l.LocalTime)
+				if err := os.Rename(name, newName); err != nil {
+					return fmt.Errorf("can't rename log file: %s", err)
+				}
 
-		if err := chown(name, info); err != nil {
-			return err
+				if err := chown(name, info); err != nil {
+					return err
+				}
+			} else {
+				os.Remove(name)
+			}
+		case ConstRotateHour:
+		default:
+			// 直接删除
+			os.Remove(name)
 		}
 	}
 
@@ -224,7 +236,7 @@ func backupName(name string, local bool) string {
 	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", filename, timestamp, fileNameExt))
 }
 
-func (l *Logger) openExistingOrNew(writeLen int64) error {
+func (l *Logger) openExistingOrNew(writeLen uint64) error {
 	// 如果没有配置输出文件名，直接输出到控制台
 	if l.emptyFile() {
 		l.writer = defaultOutput
@@ -242,8 +254,8 @@ func (l *Logger) openExistingOrNew(writeLen int64) error {
 	}
 
 	// 只有在文件rolling的情况下才需要判断文件大小
-	if l.RotateType != ConstRotateHour {
-		if info.Size()+writeLen >= l.fileMax() {
+	if l.RotateType == ConstRotateFileSize {
+		if uint64(info.Size())+writeLen >= l.fileMax() {
 			return l.rotate()
 		}
 	}
@@ -254,7 +266,7 @@ func (l *Logger) openExistingOrNew(writeLen int64) error {
 	}
 	l.writer = file
 	l.isFile = true
-	l.size = info.Size()
+	l.size = uint64(info.Size())
 	l.nextRotateTime = getNextRotateTime()
 	return nil
 }
@@ -271,7 +283,7 @@ func (l *Logger) millRunOnce() error {
 	}
 
 	var remove []logInfo
-	if l.GetRotateType() == ConstRotateFileSize && l.MaxBackups > 0 && l.MaxBackups < int64(len(files)) {
+	if l.GetRotateType() == ConstRotateFileSize && l.MaxBackups > 0 && l.MaxBackups < uint64(len(files)) {
 		remove = append(remove, files[l.MaxBackups:]...)
 		files = files[0:l.MaxBackups]
 	}
@@ -326,7 +338,7 @@ func (l *Logger) oldLogFiles() ([]logInfo, error) {
 	var logFiles []logInfo
 
 	for _, f := range files {
-		if l.GetRotateType() == ConstRotateHour && l.IsLogDir(f) {
+		if l.IsLogDir(f) {
 			logFiles = append(logFiles, logInfo{f.ModTime(), f})
 			continue
 		} else if l.IsLogFile(f) {
@@ -340,20 +352,20 @@ func (l *Logger) oldLogFiles() ([]logInfo, error) {
 }
 
 // 基础接口
-func (l *Logger) logMax() int64 {
+func (l *Logger) logMax() uint64 {
 	if l.LogMaxSize != 0 {
-		return int64(l.LogMaxSize)
+		return uint64(l.LogMaxSize)
 	}
-	return int64(megabyte)
+	return uint64(megabyte)
 
 }
 
-func (l *Logger) fileMax() int64 {
+func (l *Logger) fileMax() uint64 {
 	if l.FileMaxSize != 0 {
-		return l.FileMaxSize * int64(megabyte)
+		return l.FileMaxSize * uint64(megabyte)
 	}
 
-	return l.FileMaxSize * defaultFileMaxSize
+	return defaultFileMaxSize * uint64(megabyte)
 }
 
 // 文件名
@@ -365,6 +377,8 @@ func (l *Logger) filename() string {
 		tmStr := fmt.Sprintf("%04d%02d%02d_%02d", tm.Year(), tm.Month(), tm.Day(), tm.Hour())
 		dailyStr := fmt.Sprintf("%04d%02d%02d", tm.Year(), tm.Month(), tm.Day())
 		return path.Join(l.Dir, dailyStr, fmt.Sprintf("%s_%s%s", prefix, tmStr, ext))
+	case ConstRotateFileSize:
+		return path.Join(l.Dir, prefix+fileNameExt)
 	default:
 		return path.Join(l.Dir, prefix+fileNameExt)
 	}
@@ -381,12 +395,14 @@ func (l *Logger) dir() string {
 		tm := currentTime()
 		suffix := fmt.Sprintf("%04d%02d%02d", tm.Year(), tm.Month(), tm.Day())
 		return path.Join(l.Dir, suffix)
+	case ConstRotateFileSize:
+		return l.Dir
 	default:
 		return l.Dir
 	}
 }
 
-func (l *Logger) GetRotateType() int64 {
+func (l *Logger) GetRotateType() uint64 {
 	return l.RotateType
 }
 
@@ -445,4 +461,3 @@ func (b byFormatTime) Swap(i, j int) {
 func (b byFormatTime) Len() int {
 	return len(b)
 }
-
