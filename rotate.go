@@ -139,8 +139,6 @@ func (l *Logger) rotateEnable(writeLen uint64) bool {
 	switch l.RotateType {
 	case ConstRotateHour:
 		return time.Now().UnixNano() >= l.nextRotateTime.UnixNano()
-	case ConstRotateFileSize:
-		return l.size+writeLen > l.fileMax()
 	default:
 		return l.size+writeLen > l.fileMax()
 	}
@@ -377,8 +375,6 @@ func (l *Logger) filename() string {
 		tmStr := fmt.Sprintf("%04d%02d%02d_%02d", tm.Year(), tm.Month(), tm.Day(), tm.Hour())
 		dailyStr := fmt.Sprintf("%04d%02d%02d", tm.Year(), tm.Month(), tm.Day())
 		return path.Join(l.Dir, dailyStr, fmt.Sprintf("%s_%s%s", prefix, tmStr, ext))
-	case ConstRotateFileSize:
-		return path.Join(l.Dir, prefix+fileNameExt)
 	default:
 		return path.Join(l.Dir, prefix+fileNameExt)
 	}
@@ -395,8 +391,6 @@ func (l *Logger) dir() string {
 		tm := currentTime()
 		suffix := fmt.Sprintf("%04d%02d%02d", tm.Year(), tm.Month(), tm.Day())
 		return path.Join(l.Dir, suffix)
-	case ConstRotateFileSize:
-		return l.Dir
 	default:
 		return l.Dir
 	}
