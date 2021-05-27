@@ -16,15 +16,11 @@ import (
 )
 
 const (
-	backupTimeFormat   = "2006-01-02 15-04-05.000"
+	backupTimeFormat   = "04_05.000"
 	defaultFileMaxSize = 100
 	fileNameExt        = ".log"
-)
-
-const (
-	_ = iota
-	ConstRotateHour      // 按每小时输出
-	ConstRotateFileSize        // 按照文件大小rotate，暂时没完全实现功能
+	interval           = time.Hour
+	megabyte           = 1024 * 1024
 )
 
 var _ io.WriteCloser = (*Logger)(nil)
@@ -37,20 +33,14 @@ type Logger struct {
 	FileName string `json:"filename" yaml:"file_name" xml:"filename"`
 	// 单条日志最大长度
 	LogMaxSize uint64 `json:"log_max_size" yaml:"log_max_size" xml:"log_max_size"`
-	// 刷新规则 ConstRotateHour，ConstRotateFileSize
-	RotateType uint64 `json:"rotate_type" yaml:"rotate_type" xml:"rotate_type"`
 	// 单个文件的最大size
 	FileMaxSize uint64 `json:"maxsize" yaml:"file_max_size" xml:"file_max_size"`
 	// 文件过期时间
-	// constRotateFileSize模式下对文件创建时间
-	// constRotateHour模式下是文件夹创建时间
 	MaxAge uint64 `json:"max_age" yaml:"max_age" xml:"max_age"`
-	// 文件最大备份数量
-	// 只在constRotateFileSize模式下生效
-	MaxBackups uint64 `json:"max_backups" yaml:"max_backups" xml:"max_backups"`
 	// 是否缓存,
 	// todo 暂未支持
-	Cache bool `json:"cache" yaml:"cache" xml:"cache"`
+	Cache     bool  `json:"cache" yaml:"cache" xml:"cache"`
+	CacheSize int32 `json:"cache_size" yaml:"cache_size" xml:"cache_size"`
 
 	// 用于记录文件大小
 	size uint64
@@ -62,8 +52,6 @@ type Logger struct {
 	mu sync.Mutex
 	// 下次日志刷新时间，constRotateHour模式下有效
 	nextRotateTime time.Time
-	// 是否是本地时间
-	LocalTime bool `json:"localtime" yaml:"localtime" xml:"localtime"`
 	// todo 后期可以优化， 缓存
 	cache []byte
 
@@ -74,7 +62,6 @@ type Logger struct {
 var (
 	currentTime = time.Now
 	os_Stat     = os.Stat
-	megabyte    = 1024 * 1024
 )
 
 func stack() string {
@@ -136,12 +123,7 @@ func (l *Logger) close() error {
 
 // 是否可以rotate
 func (l *Logger) rotateEnable(writeLen uint64) bool {
-	switch l.RotateType {
-	case ConstRotateHour:
-		return time.Now().UnixNano() >= l.nextRotateTime.UnixNano()
-	default:
-		return l.size+writeLen > l.fileMax()
-	}
+	return time.Now().UnixNano() >= l.nextRotateTime.UnixNano() || l.size+writeLen > l.fileMax()
 }
 
 func (l *Logger) Rotate() error {
@@ -185,28 +167,17 @@ func (l *Logger) openNew() error {
 	name := l.filename()
 	mode := os.FileMode(0644)
 	info, err := os_Stat(name)
-	// 备份或者删除日志
+	// 备份日志
 	if err == nil {
-		switch l.RotateType {
-		case ConstRotateFileSize:
-			if l.MaxBackups > 0 {
-				// 备份数据
-				mode = info.Mode()
-				newName := backupName(name, l.LocalTime)
-				if err := os.Rename(name, newName); err != nil {
-					return fmt.Errorf("can't rename log file: %s", err)
-				}
+		mode = info.Mode()
+		// 备份一个小时内的多份日志文件
+		newName := backupName(name)
+		if err := os.Rename(name, newName); err != nil {
+			return fmt.Errorf("can't rename log file: %s", err)
+		}
 
-				if err := chown(name, info); err != nil {
-					return err
-				}
-			} else {
-				os.Remove(name)
-			}
-		case ConstRotateHour:
-		default:
-			// 直接删除
-			os.Remove(name)
+		if err := chown(name, info); err != nil {
+			return err
 		}
 	}
 
@@ -222,16 +193,13 @@ func (l *Logger) openNew() error {
 	return nil
 }
 
-func backupName(name string, local bool) string {
+func backupName(name string) string {
 	dir := filepath.Dir(name)
 	filename := filepath.Base(name)
 	t := currentTime()
-	if !local {
-		t = t.UTC()
-	}
 
 	timestamp := t.Format(backupTimeFormat)
-	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", filename, timestamp, fileNameExt))
+	return filepath.Join(dir, filename+"-"+timestamp)
 }
 
 func (l *Logger) openExistingOrNew(writeLen uint64) error {
@@ -252,10 +220,8 @@ func (l *Logger) openExistingOrNew(writeLen uint64) error {
 	}
 
 	// 只有在文件rolling的情况下才需要判断文件大小
-	if l.RotateType == ConstRotateFileSize {
-		if uint64(info.Size())+writeLen >= l.fileMax() {
-			return l.rotate()
-		}
+	if uint64(info.Size())+writeLen >= l.fileMax() {
+		return l.rotate()
 	}
 
 	file, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY, 0644)
@@ -270,35 +236,24 @@ func (l *Logger) openExistingOrNew(writeLen uint64) error {
 }
 
 func (l *Logger) millRunOnce() error {
-	if l.MaxBackups == 0 && l.MaxAge == 0 {
+	if l.MaxAge == 0 {
 		return nil
 	}
 
-	// 所有的日志
+	// 所有的日志的文件夹
 	files, err := l.oldLogFiles()
 	if err != nil {
 		return err
 	}
-
 	var remove []logInfo
-	if l.GetRotateType() == ConstRotateFileSize && l.MaxBackups > 0 && l.MaxBackups < uint64(len(files)) {
-		remove = append(remove, files[l.MaxBackups:]...)
-		files = files[0:l.MaxBackups]
-	}
-
 	if l.MaxAge > 0 {
 		diff := time.Duration(int64(24*time.Hour) * int64(l.MaxAge))
 		cutoff := currentTime().Add(-1 * diff)
-
-		var remaining []logInfo
 		for _, f := range files {
 			if f.timestamp.Before(cutoff) {
 				remove = append(remove, f)
-			} else {
-				remaining = append(remaining, f)
 			}
 		}
-		files = remaining
 	}
 
 	for _, f := range remove {
@@ -369,15 +324,10 @@ func (l *Logger) fileMax() uint64 {
 // 文件名
 func (l *Logger) filename() string {
 	prefix, ext := l.baseFileName(), fileNameExt
-	switch l.RotateType {
-	case ConstRotateHour:
-		tm := currentTime()
-		tmStr := fmt.Sprintf("%04d%02d%02d_%02d", tm.Year(), tm.Month(), tm.Day(), tm.Hour())
-		dailyStr := fmt.Sprintf("%04d%02d%02d", tm.Year(), tm.Month(), tm.Day())
-		return path.Join(l.Dir, dailyStr, fmt.Sprintf("%s_%s%s", prefix, tmStr, ext))
-	default:
-		return path.Join(l.Dir, prefix+fileNameExt)
-	}
+	tm := currentTime()
+	tmStr := fmt.Sprintf("%04d%02d%02d_%02d", tm.Year(), tm.Month(), tm.Day(), tm.Hour())
+	dailyStr := fmt.Sprintf("%04d%02d%02d", tm.Year(), tm.Month(), tm.Day())
+	return path.Join(l.Dir, dailyStr, fmt.Sprintf("%s_%s%s", prefix, tmStr, ext))
 }
 
 func (l *Logger) baseFileName() string {
@@ -386,18 +336,9 @@ func (l *Logger) baseFileName() string {
 
 // 文件路径
 func (l *Logger) dir() string {
-	switch l.RotateType {
-	case ConstRotateHour:
-		tm := currentTime()
-		suffix := fmt.Sprintf("%04d%02d%02d", tm.Year(), tm.Month(), tm.Day())
-		return path.Join(l.Dir, suffix)
-	default:
-		return l.Dir
-	}
-}
-
-func (l *Logger) GetRotateType() uint64 {
-	return l.RotateType
+	tm := currentTime()
+	suffix := fmt.Sprintf("%04d%02d%02d", tm.Year(), tm.Month(), tm.Day())
+	return path.Join(l.Dir, suffix)
 }
 
 func (l *Logger) IsLogDir(d os.FileInfo) bool {
@@ -430,10 +371,7 @@ func (l *Logger) IsLogFile(f os.FileInfo) bool {
 }
 
 func getNextRotateTime() time.Time {
-	tm := currentTime()
-	currHour := time.Date(tm.Year(), tm.Month(), tm.Day(), tm.Hour(), 0, 0, 0, time.Local)
-	nextHour := currHour.Add(time.Hour)
-	return nextHour
+	return currentTime().Truncate(interval).Add(interval)
 }
 
 // logInfo数据 用于删除旧数据
